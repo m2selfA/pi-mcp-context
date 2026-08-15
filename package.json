@@ -1,0 +1,46 @@
+{
+  "name": "pi-mcp-context",
+  "version": "0.1.0",
+  "description": "Inject cached pi-mcp-adapter MCP server context with #mentions and slash commands.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "mcp",
+    "pi-mcp-adapter",
+    "extension"
+  ],
+  "dependencies": {
+    "pi-mcp-adapter": "^2.26.0"
+  },
+  "bundledDependencies": [
+    "pi-mcp-adapter"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^20.19.43",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/context.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
