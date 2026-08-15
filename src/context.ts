@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { fuzzyFilter, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 export interface CachedTool {
   name: string;
@@ -109,6 +110,15 @@ export function createServerIndex(serverNames: readonly string[]): ServerIndex {
   }
 
   return { serverNames: unique, aliasByServer, serverByAlias };
+}
+
+export function filterServerCompletions(
+  items: readonly AutocompleteItem[],
+  query: string,
+): AutocompleteItem[] {
+  const normalized = query.trim();
+  if (normalized.length === 0) return [...items];
+  return fuzzyFilter([...items], normalized, (item) => item.label);
 }
 
 export function resolveServerReference(index: ServerIndex, reference: string): string | undefined {

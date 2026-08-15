@@ -8,6 +8,7 @@ import {
   buildEditorText,
   createServerIndex,
   expandServerMentions,
+  filterServerCompletions,
   loadMetadataCache,
   parseCommandInput,
   renderServerContext,
@@ -170,7 +171,10 @@ export default function piMcpContext(pi: ExtensionAPI): void {
               };
             }),
           ];
-          return { prefix, items };
+          return {
+            prefix,
+            items: filterServerCompletions(items, slash[1] ?? ""),
+          };
         }
 
         return current.getSuggestions(lines, line, col, options);

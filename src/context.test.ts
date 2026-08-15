@@ -4,6 +4,7 @@ import {
   buildEditorText,
   createServerIndex,
   expandServerMentions,
+  filterServerCompletions,
   parseCommandInput,
   renderServerContext,
   resolveServerReference,
@@ -20,6 +21,23 @@ test("creates stable aliases and resolves server names", () => {
     assert.equal(resolveServerReference(index, alias), serverName);
   }
   assert.equal(resolveServerReference(index, "github"), "github");
+});
+
+test("filters slash completions by fuzzy server text", () => {
+  const items = [
+    { value: "mcp:github", label: "/mcp:github", description: "github (connected, 4 tools)" },
+    { value: "mcp:gitlab", label: "/mcp:gitlab", description: "gitlab (cached)" },
+    { value: "mcp:select", label: "/mcp:select", description: "Choose an MCP server" },
+  ];
+
+  assert.deepEqual(
+    filterServerCompletions(items, "gth").map((item) => item.value),
+    ["mcp:github"],
+  );
+  assert.deepEqual(
+    filterServerCompletions(items, "sel").map((item) => item.value),
+    ["mcp:select"],
+  );
 });
 
 test("expands only known #server mentions", () => {
