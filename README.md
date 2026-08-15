@@ -11,7 +11,7 @@ For a published GitHub repository, install the package from its Git ref and keep
 
 ```powershell
 pi install npm:pi-mcp-adapter
-pi install git:github.com/<owner>/pi-mcp-context
+pi install git:github.com/m2selfA/pi-mcp-context
 ```
 
 For local development, install the two Pi packages separately. The adapter is the MCP runtime; this package is only its context-injection companion:
