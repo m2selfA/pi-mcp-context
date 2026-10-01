@@ -1,66 +1,52 @@
-import {
-  MCP_STATUS_EVENT,
-  type McpServerStatusSnapshot,
-  type McpStatusSnapshot,
-} from "pi-mcp-adapter";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   buildEditorText,
+  createNativeMcpSnapshot,
   createServerIndex,
   expandServerMentions,
   filterServerCompletions,
-  loadMetadataCache,
   parseCommandInput,
   renderServerContext,
+  renderServerUse,
+  renderServerUseWithTools,
   resolveServerReference,
+  type MentionRenderOptions,
+  type NativeMcpServer,
+  type NativeMcpSnapshot,
 } from "./context.ts";
 
 const SELECT_COMMAND = "mcp:select";
 
 export default function piMcpContext(pi: ExtensionAPI): void {
-  let cache = loadMetadataCache();
-  let statuses = new Map<string, McpServerStatusSnapshot>();
+  let mcpServersSection = "";
+  let snapshot: NativeMcpSnapshot = { servers: [] };
   let index = createServerIndex([]);
   const registeredServerCommands = new Set<string>();
   let autocompleteInstalled = false;
-  let removeStatusListener: (() => void) | undefined;
 
   const refreshInventory = (): void => {
-    cache = loadMetadataCache();
-    const names = new Set<string>(Object.keys(cache?.servers ?? {}));
-    for (const name of statuses.keys()) names.add(name);
-    index = createServerIndex([...names]);
+    snapshot = createNativeMcpSnapshot(pi.getAllTools(), mcpServersSection);
+    index = createServerIndex(snapshot.servers.map((server) => server.name));
     registerServerCommands();
   };
 
-  const statusHandler = (value: unknown): void => {
-    if (!isStatusSnapshot(value)) return;
-    statuses = new Map(value.servers.map((server) => [server.name, server]));
-    refreshInventory();
-  };
-
-  const subscribeStatus = (): void => {
-    if (!removeStatusListener) removeStatusListener = pi.events.on(MCP_STATUS_EVENT, statusHandler);
-  };
-  subscribeStatus();
-
   pi.registerCommand(SELECT_COMMAND, {
-    description: "Choose an MCP server and prepare its cached context in the editor.",
+    description: "Choose a Pi-native MCP namespace and prepare its context in the editor.",
     handler: async (args, ctx) => {
       refreshInventory();
       if (!ctx.hasUI) {
-        notify(ctx, "MCP server selection requires an interactive UI.", "warning");
+        notify(ctx, "MCP namespace selection requires an interactive UI.", "warning");
         return;
       }
       if (index.serverNames.length === 0) {
-        notify(ctx, "No MCP servers are known. Start pi-mcp-adapter or reconnect a server first.", "warning");
+        notify(ctx, "No Pi-native MCP namespaces are currently visible. Run /mcp, then retry.", "warning");
         return;
       }
       const choices = index.serverNames.map((name) => ({
-        label: `${index.aliasByServer.get(name)} - ${name}${statusSuffix(name)}`,
+        label: formatServerChoice(name),
         serverName: name,
       }));
-      const selected = await ctx.ui.select("Choose an MCP server", choices.map((choice) => choice.label));
+      const selected = await ctx.ui.select("Choose a Pi-native MCP namespace", choices.map((choice) => choice.label));
       if (!selected) return;
       const choice = choices.find((candidate) => candidate.label === selected);
       if (!choice) return;
@@ -68,8 +54,15 @@ export default function piMcpContext(pi: ExtensionAPI): void {
     },
   });
 
+  pi.on("before_agent_start", (event) => {
+    const sections = event.systemPromptOptions.sections;
+    if (sections) {
+      mcpServersSection = sections.mcp_servers ?? "";
+    }
+    refreshInventory();
+  });
+
   pi.on("session_start", (_event, ctx) => {
-    subscribeStatus();
     refreshInventory();
     if (ctx.mode === "tui" && !autocompleteInstalled) {
       installAutocomplete(ctx);
@@ -78,9 +71,9 @@ export default function piMcpContext(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
-    removeStatusListener?.();
-    removeStatusListener = undefined;
-    statuses.clear();
+    snapshot = { servers: [] };
+    index = createServerIndex([]);
+    mcpServersSection = "";
     autocompleteInstalled = false;
   });
 
@@ -89,12 +82,13 @@ export default function piMcpContext(pi: ExtensionAPI): void {
     refreshInventory();
 
     if (event.text.includes("#")) {
-      const expanded = expandServerMentions(event.text, index, (serverName) => renderContext(serverName));
+      const expanded = expandServerMentions(event.text, index, (serverName, options) =>
+        renderMention(serverName, options),
+      );
       if (expanded.changed) return { action: "transform" as const, text: expanded.text };
     }
 
-    // This is a race-safe fallback for a slash command typed before the
-    // adapter's first status event registered the dynamic command.
+    // Race-safe fallback for a slash command typed before a dynamic command is registered.
     const match = event.text.match(/^\s*\/mcp:([A-Za-z0-9._-]+)(?:\s+([\s\S]*?))?\s*$/);
     if (!match) return;
     const serverName = resolveServerReference(index, match[1]!);
@@ -106,7 +100,8 @@ export default function piMcpContext(pi: ExtensionAPI): void {
     };
   });
 
-  refreshInventory();
+  // Pi action methods such as getAllTools() are not available during extension loading.
+  // The first inventory refresh happens at session_start or before_agent_start.
 
   function registerServerCommands(): void {
     for (const serverName of index.serverNames) {
@@ -116,12 +111,12 @@ export default function piMcpContext(pi: ExtensionAPI): void {
       if (registeredServerCommands.has(commandName)) continue;
       registeredServerCommands.add(commandName);
       pi.registerCommand(commandName, {
-        description: `Prepare cached MCP context for ${serverName}.`,
+        description: `Prepare Pi-native MCP context for ${serverName}.`,
         handler: async (args, ctx) => {
           refreshInventory();
           const resolved = index.serverNames.includes(serverName) ? serverName : undefined;
           if (!resolved) {
-            notify(ctx, `MCP server "${serverName}" is no longer available.`, "warning");
+            notify(ctx, `MCP namespace "${serverName}" is no longer visible.`, "warning");
             return;
           }
           await prepareEditor(resolved, args, ctx);
@@ -146,7 +141,7 @@ export default function piMcpContext(pi: ExtensionAPI): void {
               return {
                 value: `#${alias}`,
                 label: `#${alias}`,
-                description: `${serverName}${statusSuffix(serverName)}`,
+                description: describeServer(serverName),
               };
             }),
           };
@@ -155,19 +150,18 @@ export default function piMcpContext(pi: ExtensionAPI): void {
         const slash = before.match(/^\/mcp:([A-Za-z0-9._-]*)$/);
         if (slash) {
           const prefix = `/mcp:${slash[1] ?? ""}`;
-          // Pi's CombinedAutocompleteProvider adds the leading slash for command items.
           const items = [
             {
               value: "mcp:select",
               label: "/mcp:select",
-              description: "Choose an MCP server from a UI selector",
+              description: "Choose a Pi-native MCP namespace",
             },
             ...index.serverNames.map((serverName) => {
               const alias = index.aliasByServer.get(serverName)!;
               return {
                 value: `mcp:${alias}`,
                 label: `/mcp:${alias}`,
-                description: `${serverName}${statusSuffix(serverName)}`,
+                description: describeServer(serverName),
               };
             }),
           ];
@@ -190,43 +184,49 @@ export default function piMcpContext(pi: ExtensionAPI): void {
 
   async function prepareEditor(serverName: string, args: string, ctx: ExtensionCommandContext): Promise<void> {
     const parsed = parseCommandInput(args);
-    const context = renderContext(serverName, parsed.includeSchemas);
-    const text = buildEditorText(context, parsed.prompt);
+    const text = buildEditorText(renderContext(serverName, parsed.includeSchemas), parsed.prompt);
     if (!ctx.hasUI) {
       pi.sendUserMessage(text);
       return;
     }
     ctx.ui.setEditorText(text);
-    notify(ctx, `Prepared MCP context for ${serverName}. Review it in the editor and submit.`, "info");
+    notify(ctx, `Prepared Pi-native MCP context for ${serverName}. Review it in the editor and submit.`, "info");
+  }
+
+  function renderMention(serverName: string, options: MentionRenderOptions): string {
+    const server = getServer(serverName);
+    if (options.full) return renderServerContext(server, { includeSchemas: options.includeSchemas === true });
+    if (options.listTools) return renderServerUseWithTools(server);
+    return renderServerUse(server);
   }
 
   function renderContext(serverName: string, includeSchemas = false): string {
-    const entry = cache?.servers[serverName];
-    return renderServerContext(serverName, entry, statuses.get(serverName), { includeSchemas });
+    return renderServerContext(getServer(serverName), { includeSchemas });
   }
 
-  function statusSuffix(serverName: string): string {
-    const status = statuses.get(serverName);
-    if (!status) return " (cached)";
-    return ` (${status.status}, ${status.toolCount} tools)`;
+  function getServer(serverName: string): NativeMcpServer {
+    return (
+      snapshot.servers.find((server) => server.name === serverName) ?? {
+        name: serverName,
+        namespace: { name: `mcp__${serverName.replace(/-/g, "_")}` },
+        tools: [],
+      }
+    );
+  }
+
+  function describeServer(serverName: string): string {
+    const server = getServer(serverName);
+    const exposure = server.exposure ? `, ${server.exposure}` : "";
+    const count = server.tools.length === 0 ? "no registered tools" : `${server.tools.length} tools`;
+    return `${server.namespace.name} (${count}${exposure})`;
+  }
+
+  function formatServerChoice(serverName: string): string {
+    const alias = index.aliasByServer.get(serverName) ?? serverName;
+    return `${alias} - ${serverName} — ${describeServer(serverName)}`;
   }
 
   function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
     if (ctx.hasUI) ctx.ui.notify(message, level);
   }
-}
-
-function isStatusSnapshot(value: unknown): value is McpStatusSnapshot {
-  if (!isRecord(value) || !Array.isArray(value.servers)) return false;
-  return value.servers.every((server) => {
-    if (!isRecord(server)) return false;
-    return typeof server.name === "string"
-      && typeof server.status === "string"
-      && typeof server.toolCount === "number"
-      && typeof server.disabled === "boolean";
-  });
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

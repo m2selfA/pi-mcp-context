@@ -14,6 +14,12 @@ coverage/
 .env.*
 !.env.example
 
+# Pi local project override (local MCP config)
+.pi/
+
+# Persistent agent planning state
+.planning/
+
 # Package-manager logs
 npm-debug.log*
 yarn-debug.log*

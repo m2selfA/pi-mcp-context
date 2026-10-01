@@ -1,47 +1,45 @@
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
 import { fuzzyFilter, type AutocompleteItem } from "@earendil-works/pi-tui";
 
-export interface CachedTool {
+export type NativeToolExposure = "codemode" | "deferred" | "direct" | "hidden" | "mixed" | string;
+
+export interface NativeToolNamespace {
   name: string;
   description?: string;
-  inputSchema?: unknown;
-  resourceUri?: string;
-}
-
-export interface CachedResource {
-  uri: string;
-  name: string;
-  description?: string;
-}
-
-export interface CachedPrompt {
-  name: string;
-  title?: string;
-  description?: string;
-  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
-}
-
-export interface CachedServerEntry {
-  tools?: CachedTool[];
-  resources?: CachedResource[];
-  prompts?: CachedPrompt[];
   instructions?: string;
-  cachedAt?: number;
 }
 
-export interface AdapterMetadataCache {
-  version?: number;
-  servers: Record<string, CachedServerEntry>;
-}
-
-export interface AdapterServerStatus {
+/** Structural subset of Pi's ToolInfo used by the pure snapshot builder. */
+export interface NativeToolInfo {
   name: string;
-  status: string;
-  toolCount: number;
-  resourceCount?: number;
-  disabled: boolean;
+  description?: string;
+  parameters?: unknown;
+  exposure?: NativeToolExposure;
+  namespace?: NativeToolNamespace;
+}
+
+export interface NativeMcpTool {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+  exposure?: NativeToolExposure;
+  namespace: NativeToolNamespace;
+}
+
+export interface NativeMcpServer {
+  name: string;
+  namespace: NativeToolNamespace;
+  exposure?: NativeToolExposure;
+  tools: NativeMcpTool[];
+}
+
+export interface NativeMcpSnapshot {
+  servers: NativeMcpServer[];
+}
+
+export interface NativeMcpServerHint {
+  name: string;
+  namespace: NativeToolNamespace;
+  exposure?: NativeToolExposure;
 }
 
 export interface ServerIndex {
@@ -60,39 +58,107 @@ export interface CommandInputOptions {
   prompt: string;
 }
 
-const DEFAULT_MAX_CHARS = 12_000;
-const SAFE_ALIAS_CHARACTER = /[A-Za-z0-9._-]/;
-const SERVER_MENTION_PATTERN = /(^|[\s])#([A-Za-z0-9._-]+)(?![A-Za-z0-9._-])/g;
-
-export function getAdapterCachePath(): string {
-  const override = process.env.PI_MCP_CONTEXT_CACHE_PATH?.trim();
-  if (override) return resolve(expandHome(override));
-
-  const manifest = readPiManifest();
-  const appName = manifest?.name ?? "pi";
-  const configDir = manifest?.configDir ?? ".pi";
-  const envName = `${appName.toUpperCase()}_CODING_AGENT_DIR`;
-  const configured = process.env[envName]?.trim();
-  const agentDir = configured
-    ? resolve(expandHome(configured))
-    : join(homedir(), String(configDir).trim() || ".pi", "agent");
-  return join(agentDir, "mcp-cache.json");
+export interface MentionRenderOptions {
+  /** --full / --schemas: expand to the complete currently registered catalog. */
+  full?: boolean;
+  /** --schemas / --schema: include input schemas in the full render. */
+  includeSchemas?: boolean;
+  /** -t / --tools: include qualified tool names without schemas. */
+  listTools?: boolean;
 }
 
-export function loadMetadataCache(path = getAdapterCachePath()): AdapterMetadataCache | null {
-  if (!existsSync(path)) return null;
-  try {
-    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (!isRecord(value) || !isRecord(value.servers)) return null;
-    const servers: Record<string, CachedServerEntry> = {};
-    for (const [serverName, rawEntry] of Object.entries(value.servers)) {
-      const entry = normalizeServerEntry(rawEntry);
-      if (entry) servers[serverName] = entry;
-    }
-    return { version: asNumber(value.version), servers };
-  } catch {
-    return null;
+const DEFAULT_MAX_CHARS = 12_000;
+const MAX_TOOL_NAMES = 40;
+const SAFE_ALIAS_CHARACTER = /[A-Za-z0-9._-]/;
+const MCP_NAMESPACE_PREFIX = "mcp__";
+const SERVER_MENTION_PATTERN =
+  /(^|[\s])#([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)((?:\s+(?:-t|--tools|-f|--full|--schema|--schemas))*)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])/g;
+
+/**
+ * Build a Pi-native MCP snapshot from registered tools and the structured
+ * `mcp_servers` system-prompt section. No MCP client, cache, or adapter event
+ * is involved.
+ */
+export function createNativeMcpSnapshot(
+  tools: readonly NativeToolInfo[],
+  mcpServersSection = "",
+): NativeMcpSnapshot {
+  const byNamespace = new Map<string, NativeMcpServer>();
+
+  for (const hint of parseMcpServersSection(mcpServersSection)) {
+    byNamespace.set(hint.namespace.name, {
+      name: hint.name,
+      namespace: hint.namespace,
+      exposure: hint.exposure,
+      tools: [],
+    });
   }
+
+  for (const tool of tools) {
+    const namespace = getMcpNamespace(tool);
+    if (!namespace) continue;
+
+    const existing = byNamespace.get(namespace.name);
+    const server: NativeMcpServer = existing ?? {
+      name: namespace.name.slice(MCP_NAMESPACE_PREFIX.length),
+      namespace,
+      tools: [],
+    };
+    server.namespace = mergeNamespace(server.namespace, namespace);
+    server.exposure = mergeExposure(server.exposure, tool.exposure);
+
+    const duplicate = server.tools.some(
+      (candidate) => candidate.name === tool.name && candidate.namespace.name === namespace.name,
+    );
+    if (!duplicate) {
+      server.tools.push({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+        exposure: tool.exposure,
+        namespace,
+      });
+    }
+    byNamespace.set(namespace.name, server);
+  }
+
+  const servers = [...byNamespace.values()]
+    .map((server) => ({
+      ...server,
+      tools: [...server.tools].sort((left, right) => left.name.localeCompare(right.name)),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+
+  return { servers };
+}
+
+/** Parse Pi's one-line `mcp_servers` prompt section without treating it as a status API. */
+export function parseMcpServersSection(section: string): NativeMcpServerHint[] {
+  const hints: NativeMcpServerHint[] = [];
+  const seen = new Set<string>();
+  const text = section.replace(/<\/?mcp_servers>/g, "");
+
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*-\s+(mcp__[A-Za-z0-9_]+)(?:\s+\(([^)]+)\))?(?:\s*:\s*(.*))?\s*$/);
+    if (!match) continue;
+
+    const namespaceName = match[1]!;
+    if (seen.has(namespaceName)) continue;
+    seen.add(namespaceName);
+
+    const exposure = normalizeExposure(match[2]);
+    const description = match[3]?.trim();
+    hints.push({
+      name: namespaceName.slice(MCP_NAMESPACE_PREFIX.length),
+      namespace: {
+        name: namespaceName,
+        ...(description ? { description } : {}),
+      },
+      ...(exposure ? { exposure } : {}),
+    });
+  }
+
+  return hints;
 }
 
 export function createServerIndex(serverNames: readonly string[]): ServerIndex {
@@ -107,6 +173,11 @@ export function createServerIndex(serverNames: readonly string[]): ServerIndex {
     while (serverByAlias.has(alias)) alias = `${base}-${suffix++}`;
     aliasByServer.set(serverName, alias);
     serverByAlias.set(alias, serverName);
+
+    const normalized = normalizeServerReference(serverName);
+    if (normalized !== serverName && !serverByAlias.has(normalized)) {
+      serverByAlias.set(normalized, serverName);
+    }
   }
 
   return { serverNames: unique, aliasByServer, serverByAlias };
@@ -122,95 +193,111 @@ export function filterServerCompletions(
 }
 
 export function resolveServerReference(index: ServerIndex, reference: string): string | undefined {
-  return index.serverByAlias.get(reference) ?? (index.serverNames.includes(reference) ? reference : undefined);
+  if (index.serverNames.includes(reference)) return reference;
+  const normalized = normalizeServerReference(reference);
+  if (index.serverNames.includes(normalized)) return normalized;
+  return index.serverByAlias.get(reference) ?? index.serverByAlias.get(normalized);
+}
+
+export function renderServerUse(server: NativeMcpServer): string {
+  const namespace = server.namespace.name;
+  const lines = [
+    `<use-mcp server="${escapeXml(server.name)}" namespace="${escapeXml(namespace)}"${exposureAttribute(server)}>` ,
+    `Use the Pi-native MCP namespace ${JSON.stringify(namespace)} for this task.`,
+    `Inside codemode, discover matching tools with searchTools("...", { namespace: ${JSON.stringify(namespace)} })`,
+    `or inspect the namespace with describeNamespace(${JSON.stringify(namespace)}).`,
+    `Call a selected tool with tools.mcp__server__tool(args), replacing it with the qualified name; for example tools.${qualifiedExample(server)}({...}).`,
+  ];
+  if (server.exposure === "deferred") {
+    lines.push("This namespace uses deferred exposure; tool_search can load matching tools for the next model call.");
+  }
+  if (server.tools.length === 0) {
+    lines.push("No tool metadata is currently registered in this context; use builtin:mcp /mcp for connection or authentication diagnostics.");
+  }
+  lines.push("</use-mcp>");
+  return lines.join("\n");
+}
+
+export function renderServerUseWithTools(server: NativeMcpServer): string {
+  const namespace = server.namespace.name;
+  const names = server.tools.map((tool) => tool.name).filter(Boolean);
+  const shown = names.slice(0, MAX_TOOL_NAMES);
+  const tail = names.length > MAX_TOOL_NAMES ? ` +${names.length - MAX_TOOL_NAMES} more` : "";
+  const toolList = shown.length > 0 ? `${shown.join(", ")}${tail}` : "(no registered tool names)";
+  const lines = [
+    `<use-mcp server="${escapeXml(server.name)}" namespace="${escapeXml(namespace)}"${exposureAttribute(server)}>` ,
+    `Use ${namespace} with these currently registered qualified tools: ${toolList}.`,
+    `Use describeNamespace(${JSON.stringify(namespace)}) for namespace instructions and searchTools() for matching tools.`,
+    `Call a selected tool through codemode as tools.<qualified_name>(args).`,
+    "</use-mcp>",
+  ];
+  return lines.join("\n");
 }
 
 export function renderServerContext(
-  serverName: string,
-  entry: CachedServerEntry | undefined,
-  status: AdapterServerStatus | undefined,
+  server: NativeMcpServer,
   options: RenderContextOptions = {},
 ): string {
   const includeSchemas = options.includeSchemas === true;
   const maxChars = Math.max(1_000, options.maxChars ?? DEFAULT_MAX_CHARS);
-  const state = status?.status ?? (entry ? "cached" : "not-connected");
-  const tools = entry?.tools ?? [];
-  const resources = entry?.resources ?? [];
-  const prompts = entry?.prompts ?? [];
-  const serializedServer = JSON.stringify(serverName) ?? "\"\"";
+  const namespace = server.namespace.name;
   const lines: string[] = [
-    `<mcp-context server="${escapeXml(serverName)}" status="${escapeXml(state)}">`,
-    "This is cached metadata for an MCP server managed by pi-mcp-adapter.",
-    `When a task matches this server, use the existing mcp proxy with server ${serializedServer}.`,
-    `The metadata may be stale; use mcp({ server: ${serializedServer} }) or mcp({ search: "...", server: ${serializedServer} }) when live details are needed.`,
+    `<mcp-context server="${escapeXml(server.name)}" namespace="${escapeXml(namespace)}"${exposureAttribute(server)}>` ,
+    "This is Pi-native MCP metadata. Pi builtin:mcp owns connections, authentication, and calls.",
+    `Discover with searchTools("...", { namespace: ${JSON.stringify(namespace)} }) or describeNamespace(${JSON.stringify(namespace)}).`,
+    `Call a selected tool through codemode as tools.mcp__server__tool(args), replacing it with the qualified name; for example tools.${qualifiedExample(server)}(args).`,
   ];
 
-  if (status?.disabled) {
-    lines.push("The adapter currently reports this server as disabled; do not assume its tools are callable.");
+  if (server.namespace.description?.trim()) {
+    lines.push(`Description: ${escapeXml(oneLine(server.namespace.description))}`);
+  }
+  if (server.namespace.instructions?.trim()) {
+    lines.push("<instructions>", escapeXml(server.namespace.instructions.trim()), "</instructions>");
   }
 
-  if (entry?.instructions?.trim()) {
-    lines.push("<instructions>", escapeXml(entry.instructions.trim()), "</instructions>");
-  }
-
-  if (tools.length > 0) {
+  if (server.tools.length > 0) {
     lines.push("<tools>");
-    for (const tool of tools) {
+    for (const tool of server.tools) {
       const description = oneLine(tool.description) || "(no description)";
-      const kind = tool.resourceUri ? ` [resource: ${escapeXml(tool.resourceUri)}]` : "";
-      lines.push(`- ${escapeXml(tool.name)}${kind}: ${escapeXml(description)}`);
-      if (includeSchemas && tool.inputSchema !== undefined) {
-        lines.push(`  schema: ${escapeXml(compactJson(tool.inputSchema, 1_600))}`);
+      const exposure = tool.exposure ? ` [${escapeXml(tool.exposure)}]` : "";
+      lines.push(`- ${escapeXml(tool.name)}${exposure}: ${escapeXml(description)}`);
+      if (includeSchemas && tool.parameters !== undefined) {
+        lines.push(`  schema: ${escapeXml(compactJson(tool.parameters, 1_600))}`);
       }
     }
     lines.push("</tools>");
   } else {
-    lines.push("No cached MCP tools are available. Ask the mcp proxy to list or search this server.");
-  }
-
-  if (resources.length > 0) {
-    lines.push("<resources>");
-    for (const resource of resources) {
-      const description = oneLine(resource.description) || resource.uri;
-      lines.push(`- ${escapeXml(resource.name)}: ${escapeXml(resource.uri)} - ${escapeXml(description)}`);
-    }
-    lines.push("</resources>");
-  }
-
-  if (prompts.length > 0) {
-    lines.push("<prompts>");
-    for (const prompt of prompts) {
-      const description = oneLine(prompt.description) || prompt.title || "(no description)";
-      lines.push(`- ${escapeXml(prompt.name)}: ${escapeXml(description)}`);
-    }
-    lines.push("</prompts>");
-  }
-
-  const timestamp = formatTimestamp(entry?.cachedAt);
-  if (timestamp) {
-    lines.push(`Metadata cache timestamp: ${timestamp}.`);
+    lines.push(
+      "No currently registered tool metadata is available for this namespace. Use builtin:mcp /mcp for connection or authentication diagnostics, then retry discovery.",
+    );
   }
 
   lines.push("</mcp-context>");
-  return truncateBlock(lines.join("\n"), maxChars);
+  return truncateBlock(lines.join("\n"), maxChars, namespace);
 }
 
 export function expandServerMentions(
   text: string,
   index: ServerIndex,
-  render: (serverName: string) => string,
+  render: (serverName: string, options: MentionRenderOptions) => string,
 ): { text: string; changed: boolean; servers: string[] } {
   const servers: string[] = [];
   const seen = new Set<string>();
-  const expanded = text.replace(SERVER_MENTION_PATTERN, (whole, whitespace: string, reference: string) => {
-    const serverName = resolveServerReference(index, reference);
-    if (!serverName) return whole;
-    if (!seen.has(serverName)) {
-      seen.add(serverName);
-      servers.push(serverName);
-    }
-    return `${whitespace}${render(serverName)}`;
-  });
+  const expanded = text.replace(
+    SERVER_MENTION_PATTERN,
+    (whole, whitespace: string, reference: string, modifiers: string) => {
+      const serverName = resolveServerReference(index, reference);
+      if (!serverName) return whole;
+      if (!seen.has(serverName)) {
+        seen.add(serverName);
+        servers.push(serverName);
+      }
+      const includeSchemas = /--(?:schema|schemas)/.test(modifiers);
+      const full = includeSchemas || /--full|-f/.test(modifiers);
+      const listTools = !full && /(?:^|\s)(?:-t|--tools)(?:\s|$)/.test(modifiers);
+      return `${whitespace}${render(serverName, { full, includeSchemas, listTools })}`;
+    },
+  );
   return { text: expanded, changed: expanded !== text, servers };
 }
 
@@ -236,38 +323,61 @@ export function escapeXml(value: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function getMcpNamespace(tool: NativeToolInfo): NativeToolNamespace | undefined {
+  const namespace = tool.namespace;
+  if (namespace?.name.startsWith(MCP_NAMESPACE_PREFIX)) return namespace;
+  const separator = tool.name.lastIndexOf("__");
+  if (!tool.name.startsWith(MCP_NAMESPACE_PREFIX) || separator <= MCP_NAMESPACE_PREFIX.length) return undefined;
+  return { name: tool.name.slice(0, separator) };
+}
+
+function mergeNamespace(left: NativeToolNamespace, right: NativeToolNamespace): NativeToolNamespace {
+  return {
+    name: left.name,
+    ...(left.description || right.description ? { description: left.description ?? right.description } : {}),
+    ...(left.instructions || right.instructions ? { instructions: left.instructions ?? right.instructions } : {}),
+  };
+}
+
+function mergeExposure(left: NativeToolExposure | undefined, right: NativeToolExposure | undefined): NativeToolExposure | undefined {
+  if (!right) return left;
+  if (!left || left === right) return left ?? right;
+  return "mixed";
+}
+
+function normalizeExposure(value: string | undefined): NativeToolExposure | undefined {
+  const exposure = value?.trim();
+  if (!exposure) return undefined;
+  if (exposure === "tool_search") return "deferred";
+  if (["codemode", "deferred", "direct", "hidden", "mixed"].includes(exposure)) return exposure;
+  return undefined;
+}
+
+function normalizeServerReference(value: string): string {
+  return value.replace(/^mcp__/, "").replace(/-/g, "_");
+}
+
 function toSafeAlias(value: string): string {
-  return [...value].map((character) => {
-    if (SAFE_ALIAS_CHARACTER.test(character)) return character;
-    return `_${character.codePointAt(0)!.toString(16)}_`;
-  }).join("");
+  return [...value]
+    .map((character) => {
+      if (SAFE_ALIAS_CHARACTER.test(character)) return character;
+      return `_${character.codePointAt(0)!.toString(16)}_`;
+    })
+    .join("");
 }
 
-function expandHome(value: string): string {
-  if (value === "~") return homedir();
-  if (value.startsWith("~/")) return join(homedir(), value.slice(2));
-  return value;
+function exposureAttribute(server: NativeMcpServer): string {
+  return server.exposure ? ` exposure="${escapeXml(server.exposure)}"` : "";
 }
 
-function readPiManifest(): { name?: string; configDir?: string } | undefined {
-  const packageDir = process.env.PI_PACKAGE_DIR?.trim();
-  if (!packageDir) return undefined;
-  try {
-    const value: unknown = JSON.parse(readFileSync(join(resolve(packageDir), "package.json"), "utf8"));
-    if (!isRecord(value) || !isRecord(value.piConfig)) return undefined;
-    return {
-      name: typeof value.piConfig.name === "string" ? value.piConfig.name : undefined,
-      configDir: typeof value.piConfig.configDir === "string" ? value.piConfig.configDir : undefined,
-    };
-  } catch {
-    return undefined;
-  }
+function qualifiedExample(server: NativeMcpServer): string {
+  return server.tools[0]?.name ?? `${server.namespace.name}__tool_name`;
 }
 
-function truncateBlock(value: string, maxChars: number): string {
+function truncateBlock(value: string, maxChars: number, namespace: string): string {
   if (value.length <= maxChars) return value;
   const closing = "\n</mcp-context>";
-  const marker = "\n[metadata truncated; use the mcp proxy for the complete catalog]";
+  const marker = `\n[context truncated; use describeNamespace(${JSON.stringify(namespace)}) for the complete namespace]`;
   const end = value.endsWith("</mcp-context>") ? closing : "";
   const available = Math.max(0, maxChars - marker.length - end.length);
   return `${value.slice(0, available)}${marker}${end}`;
@@ -280,71 +390,9 @@ function compactJson(value: unknown, maxChars: number): string {
   } catch {
     text = String(value);
   }
-  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 3)}...`;
-}
-
-function normalizeServerEntry(value: unknown): CachedServerEntry | undefined {
-  if (!isRecord(value)) return undefined;
-  const entry: CachedServerEntry = {};
-  const tools = Array.isArray(value.tools) ? value.tools.map(normalizeTool).filter(isDefined) : undefined;
-  const resources = Array.isArray(value.resources) ? value.resources.map(normalizeResource).filter(isDefined) : undefined;
-  const prompts = Array.isArray(value.prompts) ? value.prompts.map(normalizePrompt).filter(isDefined) : undefined;
-  if (tools) entry.tools = tools;
-  if (resources) entry.resources = resources;
-  if (prompts) entry.prompts = prompts;
-  if (typeof value.instructions === "string") entry.instructions = value.instructions;
-  if (typeof value.cachedAt === "number" && Number.isFinite(value.cachedAt)) entry.cachedAt = value.cachedAt;
-  return entry;
-}
-
-function normalizeTool(value: unknown): CachedTool | undefined {
-  if (!isRecord(value) || typeof value.name !== "string" || value.name.length === 0) return undefined;
-  const tool: CachedTool = { name: value.name };
-  if (typeof value.description === "string") tool.description = value.description;
-  if (value.inputSchema !== undefined) tool.inputSchema = value.inputSchema;
-  if (typeof value.resourceUri === "string") tool.resourceUri = value.resourceUri;
-  return tool;
-}
-
-function normalizeResource(value: unknown): CachedResource | undefined {
-  if (!isRecord(value) || typeof value.uri !== "string" || typeof value.name !== "string") return undefined;
-  return {
-    uri: value.uri,
-    name: value.name,
-    ...(typeof value.description === "string" ? { description: value.description } : {}),
-  };
-}
-
-function normalizePrompt(value: unknown): CachedPrompt | undefined {
-  if (!isRecord(value) || typeof value.name !== "string" || value.name.length === 0) return undefined;
-  return {
-    name: value.name,
-    ...(typeof value.title === "string" ? { title: value.title } : {}),
-    ...(typeof value.description === "string" ? { description: value.description } : {}),
-  };
-}
-
-function isDefined<T>(value: T | undefined): value is T {
-  return value !== undefined;
-}
-
-function formatTimestamp(value: number | undefined): string | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  try {
-    return new Date(value).toISOString();
-  } catch {
-    return undefined;
-  }
+  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
 function oneLine(value: string | undefined): string {
   return value?.replace(/\s+/g, " ").trim() ?? "";
-}
-
-function asNumber(value: unknown): number | undefined {
-  return typeof value === "number" ? value : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
